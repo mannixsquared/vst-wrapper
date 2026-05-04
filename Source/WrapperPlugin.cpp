@@ -1,12 +1,22 @@
 #include "WrapperPlugin.h"
 #include "BridgeProtocol.h"
 
+#include <cerrno>
+#include <cstring>
 #include <cmath>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 namespace
 {
     static constexpr int wrapperStateMagic = 0x49565753; // IVWS
     static constexpr int wrapperStateVersion = 1;
+
+    size_t sharedAudioBytesFor (int channels, int samples)
+    {
+        return sizeof (float) * static_cast<size_t> (channels) * static_cast<size_t> (samples) * 2u;
+    }
 
     juce::String envVar (const char* name)
     {
@@ -574,12 +584,20 @@ bool IntelVSTWrapperAudioProcessor::loadSelectedHostedPlugin()
 
 bool IntelVSTWrapperAudioProcessor::sendPrepare()
 {
+    const auto channels = juce::jmax (getTotalNumInputChannels(), getTotalNumOutputChannels());
+    if (! ensureSharedAudioMemory (channels, currentBlockSize))
+        return false;
+
     juce::MemoryBlock payload;
     juce::MemoryOutputStream out (payload, false);
     out.writeDouble (currentSampleRate);
     out.writeInt (currentBlockSize);
     out.writeInt (getTotalNumInputChannels());
     out.writeInt (getTotalNumOutputChannels());
+    intelvst::bridge::writeString (out, sharedAudioName);
+    out.writeInt (sharedAudioChannels);
+    out.writeInt (sharedAudioSamples);
+    out.writeInt64 (static_cast<juce::int64> (sharedAudioByteCount));
 
     if (! intelvst::bridge::sendMessage (*socket, intelvst::bridge::MessageType::prepare, payload))
     {
@@ -597,11 +615,27 @@ bool IntelVSTWrapperAudioProcessor::sendPrepare()
 
 bool IntelVSTWrapperAudioProcessor::processRemotely (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
 {
-    juce::MemoryBlock payload;
-    juce::MemoryOutputStream out (payload, false);
-
     const auto channels = buffer.getNumChannels();
     const auto samples = buffer.getNumSamples();
+
+    if (sharedAudioData == nullptr
+        || channels > sharedAudioChannels
+        || samples > sharedAudioSamples)
+    {
+        setBridgeStatus ("Shared audio buffer is not prepared");
+        return false;
+    }
+
+    auto* const sharedInput = static_cast<float*> (sharedAudioData);
+    auto* const sharedOutput = sharedInput + static_cast<size_t> (sharedAudioChannels) * static_cast<size_t> (sharedAudioSamples);
+
+    for (auto channel = 0; channel < channels; ++channel)
+        std::memcpy (sharedInput + static_cast<size_t> (channel) * static_cast<size_t> (sharedAudioSamples),
+                     buffer.getReadPointer (channel),
+                     sizeof (float) * static_cast<size_t> (samples));
+
+    juce::MemoryBlock payload;
+    juce::MemoryOutputStream out (payload, false);
     out.writeInt (channels);
     out.writeInt (samples);
 
@@ -639,9 +673,6 @@ bool IntelVSTWrapperAudioProcessor::processRemotely (juce::AudioBuffer<float>& b
         out.write (metadata.data, static_cast<size_t> (metadata.numBytes));
     }
 
-    for (auto channel = 0; channel < channels; ++channel)
-        out.write (buffer.getReadPointer (channel), sizeof (float) * static_cast<size_t> (samples));
-
     if (! intelvst::bridge::sendMessage (*socket, intelvst::bridge::MessageType::process, payload))
     {
         setBridgeStatus ("Could not send audio block to bridge");
@@ -676,8 +707,71 @@ bool IntelVSTWrapperAudioProcessor::processRemotely (juce::AudioBuffer<float>& b
     }
 
     for (auto channel = 0; channel < channels; ++channel)
-        in.read (buffer.getWritePointer (channel), static_cast<int> (sizeof (float) * static_cast<size_t> (samples)));
+        std::memcpy (buffer.getWritePointer (channel),
+                     sharedOutput + static_cast<size_t> (channel) * static_cast<size_t> (sharedAudioSamples),
+                     sizeof (float) * static_cast<size_t> (samples));
 
+    return true;
+}
+
+bool IntelVSTWrapperAudioProcessor::ensureSharedAudioMemory (int channels, int samples)
+{
+    channels = juce::jmax (1, channels);
+    samples = juce::jmax (1, samples);
+
+    const auto requiredBytes = sharedAudioBytesFor (channels, samples);
+
+    if (sharedAudioData != nullptr
+        && sharedAudioChannels >= channels
+        && sharedAudioSamples >= samples
+        && sharedAudioByteCount >= requiredBytes)
+    {
+        return true;
+    }
+
+    releaseSharedAudioMemory();
+
+    sharedAudioName = "/IntelVSTWrapper_"
+                    + juce::String (static_cast<int> (getpid()))
+                    + "_"
+                    + juce::String::toHexString (reinterpret_cast<juce::pointer_sized_int> (this));
+    sharedAudioByteCount = requiredBytes;
+    sharedAudioChannels = channels;
+    sharedAudioSamples = samples;
+
+    shm_unlink (sharedAudioName.toRawUTF8());
+    sharedAudioFd = shm_open (sharedAudioName.toRawUTF8(), O_CREAT | O_EXCL | O_RDWR, 0600);
+
+    if (sharedAudioFd < 0)
+    {
+        setBridgeStatus ("Could not create shared audio memory");
+        wrapperLog ("shm_open failed: " + juce::String (std::strerror (errno)));
+        releaseSharedAudioMemory();
+        return false;
+    }
+
+    if (ftruncate (sharedAudioFd, static_cast<off_t> (sharedAudioByteCount)) != 0)
+    {
+        setBridgeStatus ("Could not size shared audio memory");
+        wrapperLog ("ftruncate failed: " + juce::String (std::strerror (errno)));
+        releaseSharedAudioMemory();
+        return false;
+    }
+
+    sharedAudioData = mmap (nullptr, sharedAudioByteCount, PROT_READ | PROT_WRITE, MAP_SHARED, sharedAudioFd, 0);
+    if (sharedAudioData == MAP_FAILED)
+    {
+        sharedAudioData = nullptr;
+        setBridgeStatus ("Could not map shared audio memory");
+        wrapperLog ("mmap failed: " + juce::String (std::strerror (errno)));
+        releaseSharedAudioMemory();
+        return false;
+    }
+
+    std::memset (sharedAudioData, 0, sharedAudioByteCount);
+    wrapperLog ("Created shared audio memory " + sharedAudioName + " with "
+                + juce::String (sharedAudioChannels) + " channels, "
+                + juce::String (sharedAudioSamples) + " samples");
     return true;
 }
 
@@ -858,11 +952,37 @@ void IntelVSTWrapperAudioProcessor::stopHelper()
 
     pluginLoaded = false;
     helperPrepared = false;
+    releaseSharedAudioMemory();
 }
 
 void IntelVSTWrapperAudioProcessor::setBridgeStatus (const juce::String& status)
 {
     bridgeStatus = status;
+}
+
+void IntelVSTWrapperAudioProcessor::releaseSharedAudioMemory()
+{
+    if (sharedAudioData != nullptr)
+    {
+        munmap (sharedAudioData, sharedAudioByteCount);
+        sharedAudioData = nullptr;
+    }
+
+    if (sharedAudioFd >= 0)
+    {
+        close (sharedAudioFd);
+        sharedAudioFd = -1;
+    }
+
+    if (sharedAudioName.isNotEmpty())
+    {
+        shm_unlink (sharedAudioName.toRawUTF8());
+        sharedAudioName.clear();
+    }
+
+    sharedAudioByteCount = 0;
+    sharedAudioChannels = 0;
+    sharedAudioSamples = 0;
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()

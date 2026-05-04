@@ -1,6 +1,11 @@
 #include "BridgeProtocol.h"
 
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #if JUCE_MAC && INTEL_VST_WRAPPER_ENABLE_HOSTED_UI
  #import <Cocoa/Cocoa.h>
@@ -23,6 +28,7 @@ namespace
         ~HostedPlugin()
         {
             closeEditorSync();
+            unmapSharedAudioMemory();
         }
 
         bool load (const juce::String& path, juce::String& error)
@@ -78,7 +84,15 @@ namespace
             return false;
         }
 
-        bool prepare (double newSampleRate, int newBlockSize, int inputs, int outputs, juce::String& error)
+        bool prepare (double newSampleRate,
+                      int newBlockSize,
+                      int inputs,
+                      int outputs,
+                      const juce::String& sharedName,
+                      int sharedChannels,
+                      int sharedSamples,
+                      size_t sharedBytes,
+                      juce::String& error)
         {
             const juce::ScopedLock lock (pluginLock);
 
@@ -92,6 +106,9 @@ namespace
                 error = "No plugin loaded";
                 return false;
             }
+
+            if (! mapSharedAudioMemory (sharedName, sharedChannels, sharedSamples, sharedBytes, error))
+                return false;
 
             instance->setRateAndBufferSizeDetails (sampleRate, blockSize);
             instance->prepareToPlay (sampleRate, blockSize);
@@ -140,6 +157,13 @@ namespace
             const auto samples = in.readInt();
             const auto parameterUpdates = in.readInt();
 
+            if (sharedAudioData == nullptr
+                || channels > sharedAudioChannels
+                || samples > sharedAudioSamples)
+            {
+                return false;
+            }
+
             auto parameters = instance->getParameters();
             for (auto update = 0; update < parameterUpdates; ++update)
             {
@@ -163,10 +187,20 @@ namespace
             }
 
             juce::AudioBuffer<float> buffer (channels, samples);
+            auto* const sharedInput = static_cast<float*> (sharedAudioData);
+            auto* const sharedOutput = sharedInput + static_cast<size_t> (sharedAudioChannels) * static_cast<size_t> (sharedAudioSamples);
+
             for (auto channel = 0; channel < channels; ++channel)
-                in.read (buffer.getWritePointer (channel), static_cast<int> (sizeof (float) * static_cast<size_t> (samples)));
+                std::memcpy (buffer.getWritePointer (channel),
+                             sharedInput + static_cast<size_t> (channel) * static_cast<size_t> (sharedAudioSamples),
+                             sizeof (float) * static_cast<size_t> (samples));
 
             instance->processBlock (buffer, midi);
+
+            for (auto channel = 0; channel < buffer.getNumChannels(); ++channel)
+                std::memcpy (sharedOutput + static_cast<size_t> (channel) * static_cast<size_t> (sharedAudioSamples),
+                             buffer.getReadPointer (channel),
+                             sizeof (float) * static_cast<size_t> (buffer.getNumSamples()));
 
             juce::MemoryOutputStream out (result, false);
             out.writeInt (buffer.getNumChannels());
@@ -179,9 +213,6 @@ namespace
                 out.writeInt (metadata.numBytes);
                 out.write (metadata.data, static_cast<size_t> (metadata.numBytes));
             }
-
-            for (auto channel = 0; channel < buffer.getNumChannels(); ++channel)
-                out.write (buffer.getReadPointer (channel), sizeof (float) * static_cast<size_t> (buffer.getNumSamples()));
 
             return true;
         }
@@ -375,6 +406,77 @@ namespace
            #endif
         }
 
+        bool mapSharedAudioMemory (const juce::String& name,
+                                   int channels,
+                                   int samples,
+                                   size_t bytes,
+                                   juce::String& error)
+        {
+            if (name.isEmpty() || channels <= 0 || samples <= 0 || bytes == 0)
+            {
+                error = "Shared audio memory was not configured";
+                return false;
+            }
+
+            if (sharedAudioData != nullptr
+                && sharedAudioName == name
+                && sharedAudioChannels >= channels
+                && sharedAudioSamples >= samples
+                && sharedAudioByteCount >= bytes)
+            {
+                return true;
+            }
+
+            unmapSharedAudioMemory();
+
+            sharedAudioFd = shm_open (name.toRawUTF8(), O_RDWR, 0600);
+            if (sharedAudioFd < 0)
+            {
+                error = "Could not open shared audio memory";
+                helperLog ("shm_open failed for " + name + ": " + juce::String (std::strerror (errno)));
+                return false;
+            }
+
+            sharedAudioData = mmap (nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, sharedAudioFd, 0);
+            if (sharedAudioData == MAP_FAILED)
+            {
+                sharedAudioData = nullptr;
+                error = "Could not map shared audio memory";
+                helperLog ("mmap failed for " + name + ": " + juce::String (std::strerror (errno)));
+                unmapSharedAudioMemory();
+                return false;
+            }
+
+            sharedAudioName = name;
+            sharedAudioByteCount = bytes;
+            sharedAudioChannels = channels;
+            sharedAudioSamples = samples;
+            helperLog ("Mapped shared audio memory " + name + " with "
+                       + juce::String (channels) + " channels, "
+                       + juce::String (samples) + " samples");
+            return true;
+        }
+
+        void unmapSharedAudioMemory()
+        {
+            if (sharedAudioData != nullptr)
+            {
+                munmap (sharedAudioData, sharedAudioByteCount);
+                sharedAudioData = nullptr;
+            }
+
+            if (sharedAudioFd >= 0)
+            {
+                close (sharedAudioFd);
+                sharedAudioFd = -1;
+            }
+
+            sharedAudioName.clear();
+            sharedAudioByteCount = 0;
+            sharedAudioChannels = 0;
+            sharedAudioSamples = 0;
+        }
+
         static void prepareVSTGUIRendererDiagnostics()
         {
            #if JUCE_MAC && INTEL_VST_WRAPPER_ENABLE_HOSTED_UI
@@ -509,6 +611,12 @@ namespace
         std::unique_ptr<juce::AudioPluginInstance> instance;
         std::unique_ptr<PluginEditorWindow> editorWindow;
         juce::String hostedPluginPath;
+        juce::String sharedAudioName;
+        int sharedAudioFd = -1;
+        void* sharedAudioData = nullptr;
+        size_t sharedAudioByteCount = 0;
+        int sharedAudioChannels = 0;
+        int sharedAudioSamples = 0;
         double sampleRate = 44100.0;
         int blockSize = 512;
         int totalInputs = 2;
@@ -687,9 +795,21 @@ namespace
                     const auto blockSize = in.readInt();
                     const auto inputs = in.readInt();
                     const auto outputs = in.readInt();
+                    const auto sharedName = intelvst::bridge::readString (in);
+                    const auto sharedChannels = in.readInt();
+                    const auto sharedSamples = in.readInt();
+                    const auto sharedBytes = static_cast<size_t> (in.readInt64());
                     juce::String error;
 
-                    if (plugin.prepare (sampleRate, blockSize, inputs, outputs, error))
+                    if (plugin.prepare (sampleRate,
+                                        blockSize,
+                                        inputs,
+                                        outputs,
+                                        sharedName,
+                                        sharedChannels,
+                                        sharedSamples,
+                                        sharedBytes,
+                                        error))
                         sendAck (socket);
                     else
                         sendError (socket, error);

@@ -3,6 +3,7 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 
 #include <array>
+#include <cstddef>
 
 class IntelVSTWrapperAudioProcessor final : public juce::AudioProcessor,
                                             private juce::AsyncUpdater
@@ -55,17 +56,25 @@ private:
     bool refreshHostedParameters();
     bool fetchHostedState (juce::MemoryBlock& state);
     bool sendHostedState (const juce::MemoryBlock& state);
+    bool ensureSharedAudioMemory (int channels, int samples);
     juce::File findBundledHelper() const;
     juce::String configuredPluginPath() const;
     void setBridgeStatus (const juce::String& status);
     void stopHelper();
     bool loadSelectedHostedPlugin();
     void clearMirroredParameters();
+    void releaseSharedAudioMemory();
 
     juce::CriticalSection bridgeLock;
     std::unique_ptr<juce::StreamingSocket> listener;
     std::unique_ptr<juce::StreamingSocket> socket;
     juce::ChildProcess helperProcess;
+    juce::String sharedAudioName;
+    int sharedAudioFd = -1;
+    void* sharedAudioData = nullptr;
+    size_t sharedAudioByteCount = 0;
+    int sharedAudioChannels = 0;
+    int sharedAudioSamples = 0;
     std::array<MirroredParameter*, maxMirroredParameters> mirroredParameters {};
     std::array<float, maxMirroredParameters> lastSentParameterValues {};
     juce::String hostedPluginPath;
