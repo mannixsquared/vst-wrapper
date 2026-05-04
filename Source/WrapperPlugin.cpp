@@ -750,6 +750,9 @@ bool IntelVSTWrapperAudioProcessor::refreshHostedParameters()
         lastSentParameterValues[static_cast<size_t> (i)] = -1.0f;
     }
 
+    updateHostDisplay (juce::AudioProcessorListener::ChangeDetails()
+                           .withParameterInfoChanged (true)
+                           .withNonParameterStateChanged (true));
     wrapperLog ("Mirrored " + juce::String (parameterCount) + " hosted parameters");
     return true;
 }

@@ -147,7 +147,7 @@ namespace
                 const auto value = in.readFloat();
 
                 if (juce::isPositiveAndBelow (index, parameters.size()))
-                    parameters.getUnchecked (index)->setValue (juce::jlimit (0.0f, 1.0f, value));
+                    parameters.getUnchecked (index)->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, value));
             }
 
             const auto midiEvents = in.readInt();
@@ -193,7 +193,16 @@ namespace
             if (instance == nullptr)
                 return false;
 
-            instance->getStateInformation (result);
+            juce::MemoryBlock pluginState;
+            instance->getStateInformation (pluginState);
+
+            juce::MemoryOutputStream out (result, false);
+            out.writeInt (instance->getCurrentProgram());
+            out.writeInt (static_cast<int> (pluginState.getSize()));
+
+            if (! pluginState.isEmpty())
+                out.write (pluginState.getData(), pluginState.getSize());
+
             helperLog ("Captured hosted plugin state: " + juce::String (static_cast<int> (result.getSize())) + " bytes");
             return true;
         }
@@ -205,7 +214,32 @@ namespace
             if (instance == nullptr)
                 return false;
 
-            instance->setStateInformation (state.getData(), static_cast<int> (state.getSize()));
+            juce::MemoryBlock pluginState;
+            auto program = -1;
+
+            if (state.getSize() >= 8)
+            {
+                juce::MemoryInputStream in (state, false);
+                program = in.readInt();
+                const auto stateBytes = in.readInt();
+
+                if (stateBytes >= 0 && stateBytes <= static_cast<int> (state.getSize() - 8))
+                {
+                    pluginState.setSize (static_cast<size_t> (stateBytes), false);
+
+                    if (stateBytes > 0)
+                        in.read (pluginState.getData(), stateBytes);
+                }
+            }
+
+            if (pluginState.isEmpty())
+                pluginState = state;
+
+            instance->setStateInformation (pluginState.getData(), static_cast<int> (pluginState.getSize()));
+
+            if (juce::isPositiveAndBelow (program, instance->getNumPrograms()))
+                instance->setCurrentProgram (program);
+
             helperLog ("Applied hosted plugin state: " + juce::String (static_cast<int> (state.getSize())) + " bytes");
             return true;
         }
