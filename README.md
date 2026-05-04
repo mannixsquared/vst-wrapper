@@ -143,6 +143,44 @@ cmake -S . -B build \
 
 The SDK root must contain `pluginterfaces/vst2.x/aeffect.h`.
 
+## Signing and Notarization
+
+For public distribution, use a Developer ID Application certificate and notarize
+the release zips. Ad-hoc signing is useful for local testing, but it will not
+give other users the same drop-in experience after downloading from the web.
+
+The release packaging script signs the wrapper bundle and the bundled helper,
+then creates VST3 and AU zip archives:
+
+```sh
+VERSION=v0.2.0 \
+SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+./scripts/package_release.sh
+```
+
+To notarize as part of packaging, first store a notarytool profile:
+
+```sh
+xcrun notarytool store-credentials vst-wrapper \
+  --apple-id "you@example.com" \
+  --team-id "TEAMID" \
+  --password "app-specific-password"
+```
+
+Then include the profile name:
+
+```sh
+VERSION=v0.2.0 \
+SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+NOTARY_PROFILE=vst-wrapper \
+./scripts/package_release.sh
+```
+
+The helper is signed with `com.apple.security.cs.disable-library-validation` so
+it can host third-party plug-in bundles while using the hardened runtime.
+The release zips are the notarized artifacts; do not staple the `.vst3` or
+`.component` bundles directly after notarizing the zip.
+
 The wrapper writes runtime status logs here:
 
 ```sh
