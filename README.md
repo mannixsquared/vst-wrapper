@@ -9,9 +9,25 @@ processes, not individual plugin dynamic libraries. This project therefore build
 - `IntelVSTBridgeHelper`: an `x86_64` helper executable. macOS launches it under
   Rosetta, and it hosts the Intel plugin out-of-process.
 
-Audio is passed between the wrapper and helper over a local TCP socket using a
-small synchronous binary protocol. This is intentionally simple and suitable as a
-starting point, not a polished commercial bridge.
+Audio buffers are exchanged through POSIX shared memory. A small synchronous
+local TCP protocol is still used for control messages, MIDI, state, parameters,
+and per-block synchronization. This is intentionally small and pragmatic rather
+than a polished commercial bridge.
+
+## Downloads
+
+Known-good builds are published on the GitHub releases page:
+
+- [Latest release](https://github.com/mannixsquared/vst-wrapper/releases/latest)
+- [v0.2.0 VST3](https://github.com/mannixsquared/vst-wrapper/releases/download/v0.2.0/Intel-VST-Wrapper-v0.2.0-vst3.zip)
+- [v0.2.0 AU](https://github.com/mannixsquared/vst-wrapper/releases/download/v0.2.0/Intel-VST-Wrapper-v0.2.0-au.zip)
+
+Install by unzipping the bundle and copying it to one of:
+
+```sh
+~/Library/Audio/Plug-Ins/VST3/
+~/Library/Audio/Plug-Ins/Components/
+```
 
 ## Requirements
 
@@ -33,6 +49,8 @@ cmake --build build --config Release
 ```
 
 The wrapper copies `IntelVSTBridgeHelper` into the plugin bundle resources.
+The helper is required at runtime, so distribute the full `.vst3` or
+`.component` bundle rather than only the wrapper binary.
 
 For Intel VST2 plugins with older Carbon-era UI assumptions, build the helper
 through the legacy path:
@@ -93,18 +111,23 @@ Implemented:
 - ARM/universal JUCE wrapper target
 - x86_64 Rosetta helper target
 - out-of-process VST/VST3 hosting through JUCE plugin formats
-- synchronous audio buffer processing
+- shared-memory audio buffer processing
 - basic MIDI event forwarding
 - hosted plugin path save/restore
+- hosted plugin state save/restore
+- mirrored hosted plugin parameters for DAW automation playback
 - hosted plugin editor windows opened from the x86_64 helper process
 
 Known limitations:
 
 - Hosted plugin editors appear in a separate helper-owned window, not embedded
   inside the wrapper editor
-- No parameter automation bridge yet
-- Hosted plugin state/preset data is not bridged yet
-- The synchronous socket path is simple, but not real-time ideal
+- Only parameters exposed by the hosted plugin can be mirrored. UI-only controls
+  may need to be automated through the hosted plugin's own MIDI mapping.
+- Automation playback is bridged for mirrored parameters, but automation
+  recording/latch feedback from the hosted plugin UI is not implemented yet.
+- The audio buffers use shared memory, but each block still waits on a
+  synchronous socket round-trip for coordination.
 - VST2 support requires Steinberg VST2 SDK headers
 
 ## VST2 Plugins
@@ -127,5 +150,5 @@ The wrapper writes runtime status logs here:
 ~/Library/Logs/IntelVSTWrapperHelper.log
 ```
 
-For serious low-latency work, the next step is replacing the per-block socket
-payload with shared memory plus a lock-free command ring.
+For more demanding low-latency work, the next step would be replacing the
+synchronous per-block control exchange with a shared-memory command ring.
