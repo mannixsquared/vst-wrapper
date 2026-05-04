@@ -1,6 +1,7 @@
 #include "WrapperPlugin.h"
 #include "BridgeProtocol.h"
 
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <cmath>
@@ -12,6 +13,7 @@ namespace
 {
     static constexpr int wrapperStateMagic = 0x49565753; // IVWS
     static constexpr int wrapperStateVersion = 1;
+    std::atomic<juce::uint32> sharedAudioNameCounter { 0 };
 
     size_t sharedAudioBytesFor (int channels, int samples)
     {
@@ -731,10 +733,9 @@ bool IntelVSTWrapperAudioProcessor::ensureSharedAudioMemory (int channels, int s
 
     releaseSharedAudioMemory();
 
-    sharedAudioName = "/IntelVSTWrapper_"
-                    + juce::String (static_cast<int> (getpid()))
-                    + "_"
-                    + juce::String::toHexString (reinterpret_cast<juce::pointer_sized_int> (this));
+    sharedAudioName = "/ivw"
+                    + juce::String::toHexString (static_cast<int> (getpid()))
+                    + juce::String::toHexString (static_cast<int> (++sharedAudioNameCounter));
     sharedAudioByteCount = requiredBytes;
     sharedAudioChannels = channels;
     sharedAudioSamples = samples;
