@@ -15,7 +15,12 @@ namespace intelvst::bridge
         processResult = 5,
         shutdown = 6,
         error = 7,
-        openEditor = 8
+        openEditor = 8,
+        getState = 9,
+        setState = 10,
+        state = 11,
+        getParameters = 12,
+        parameters = 13
     };
 
     struct Header

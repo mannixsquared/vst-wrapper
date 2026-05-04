@@ -138,6 +138,18 @@ namespace
             juce::MemoryInputStream in (payload, false);
             const auto channels = in.readInt();
             const auto samples = in.readInt();
+            const auto parameterUpdates = in.readInt();
+
+            auto parameters = instance->getParameters();
+            for (auto update = 0; update < parameterUpdates; ++update)
+            {
+                const auto index = in.readInt();
+                const auto value = in.readFloat();
+
+                if (juce::isPositiveAndBelow (index, parameters.size()))
+                    parameters.getUnchecked (index)->setValue (juce::jlimit (0.0f, 1.0f, value));
+            }
+
             const auto midiEvents = in.readInt();
 
             juce::MidiBuffer midi;
@@ -171,6 +183,56 @@ namespace
             for (auto channel = 0; channel < buffer.getNumChannels(); ++channel)
                 out.write (buffer.getReadPointer (channel), sizeof (float) * static_cast<size_t> (buffer.getNumSamples()));
 
+            return true;
+        }
+
+        bool getState (juce::MemoryBlock& result)
+        {
+            const juce::ScopedLock lock (pluginLock);
+
+            if (instance == nullptr)
+                return false;
+
+            instance->getStateInformation (result);
+            helperLog ("Captured hosted plugin state: " + juce::String (static_cast<int> (result.getSize())) + " bytes");
+            return true;
+        }
+
+        bool setState (const juce::MemoryBlock& state)
+        {
+            const juce::ScopedLock lock (pluginLock);
+
+            if (instance == nullptr)
+                return false;
+
+            instance->setStateInformation (state.getData(), static_cast<int> (state.getSize()));
+            helperLog ("Applied hosted plugin state: " + juce::String (static_cast<int> (state.getSize())) + " bytes");
+            return true;
+        }
+
+        bool getParameters (juce::MemoryBlock& result)
+        {
+            const juce::ScopedLock lock (pluginLock);
+
+            if (instance == nullptr)
+                return false;
+
+            auto parameters = instance->getParameters();
+            juce::MemoryOutputStream out (result, false);
+            out.writeInt (parameters.size());
+
+            for (auto* parameter : parameters)
+            {
+                intelvst::bridge::writeString (out, parameter->getName (128));
+                intelvst::bridge::writeString (out, parameter->getLabel());
+                out.writeFloat (parameter->getDefaultValue());
+                out.writeFloat (parameter->getValue());
+                out.writeInt (parameter->getNumSteps());
+                out.writeBool (parameter->isDiscrete());
+                out.writeBool (parameter->isBoolean());
+            }
+
+            helperLog ("Reported " + juce::String (parameters.size()) + " hosted parameters");
             return true;
         }
 
@@ -623,6 +685,38 @@ namespace
                     break;
                 }
 
+                case intelvst::bridge::MessageType::getState:
+                {
+                    juce::MemoryBlock state;
+                    if (plugin.getState (state))
+                        intelvst::bridge::sendMessage (socket, intelvst::bridge::MessageType::state, state);
+                    else
+                        sendError (socket, "Could not get hosted plugin state");
+
+                    break;
+                }
+
+                case intelvst::bridge::MessageType::setState:
+                {
+                    if (plugin.setState (payload))
+                        sendAck (socket);
+                    else
+                        sendError (socket, "Could not restore hosted plugin state");
+
+                    break;
+                }
+
+                case intelvst::bridge::MessageType::getParameters:
+                {
+                    juce::MemoryBlock parameters;
+                    if (plugin.getParameters (parameters))
+                        intelvst::bridge::sendMessage (socket, intelvst::bridge::MessageType::parameters, parameters);
+                    else
+                        sendError (socket, "Could not read hosted plugin parameters");
+
+                    break;
+                }
+
                 case intelvst::bridge::MessageType::shutdown:
                     running = false;
                     break;
@@ -630,6 +724,8 @@ namespace
                 case intelvst::bridge::MessageType::hello:
                 case intelvst::bridge::MessageType::processResult:
                 case intelvst::bridge::MessageType::error:
+                case intelvst::bridge::MessageType::state:
+                case intelvst::bridge::MessageType::parameters:
                 default:
                     sendError (socket, "Unexpected bridge message");
                     break;

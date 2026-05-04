@@ -2,6 +2,8 @@
 
 #include <juce_audio_utils/juce_audio_utils.h>
 
+#include <array>
+
 class IntelVSTWrapperAudioProcessor final : public juce::AudioProcessor,
                                             private juce::AsyncUpdater
 {
@@ -39,6 +41,10 @@ public:
     void openHostedPluginEditor();
 
 private:
+    class MirroredParameter;
+
+    static constexpr int maxMirroredParameters = 128;
+
     static BusesProperties makeBuses();
 
     bool ensureHelper();
@@ -46,23 +52,32 @@ private:
     bool sendPrepare();
     bool processRemotely (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi);
     bool receiveAckOrStatus (const char* action);
+    bool refreshHostedParameters();
+    bool fetchHostedState (juce::MemoryBlock& state);
+    bool sendHostedState (const juce::MemoryBlock& state);
     juce::File findBundledHelper() const;
     juce::String configuredPluginPath() const;
     void setBridgeStatus (const juce::String& status);
     void stopHelper();
     bool loadSelectedHostedPlugin();
+    void clearMirroredParameters();
 
     juce::CriticalSection bridgeLock;
     std::unique_ptr<juce::StreamingSocket> listener;
     std::unique_ptr<juce::StreamingSocket> socket;
     juce::ChildProcess helperProcess;
+    std::array<MirroredParameter*, maxMirroredParameters> mirroredParameters {};
+    std::array<float, maxMirroredParameters> lastSentParameterValues {};
     juce::String hostedPluginPath;
+    juce::MemoryBlock hostedPluginState;
+    juce::MemoryBlock pendingHostedPluginState;
     juce::String bridgeStatus = "No hosted plugin selected";
     double currentSampleRate = 44100.0;
     int currentBlockSize = 512;
     bool pluginLoaded = false;
     bool helperPrepared = false;
     bool pendingStateLoad = false;
+    bool pendingHostedPluginStateValid = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (IntelVSTWrapperAudioProcessor)
 };

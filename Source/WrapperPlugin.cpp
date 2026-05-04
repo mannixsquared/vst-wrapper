@@ -1,8 +1,13 @@
 #include "WrapperPlugin.h"
 #include "BridgeProtocol.h"
 
+#include <cmath>
+
 namespace
 {
+    static constexpr int wrapperStateMagic = 0x49565753; // IVWS
+    static constexpr int wrapperStateVersion = 1;
+
     juce::String envVar (const char* name)
     {
         return juce::SystemStats::getEnvironmentVariable (name, {});
@@ -124,6 +129,103 @@ namespace
     };
 }
 
+class IntelVSTWrapperAudioProcessor::MirroredParameter final : public juce::AudioProcessorParameter
+{
+public:
+    explicit MirroredParameter (int indexToUse)
+        : index (indexToUse)
+    {
+        reset();
+    }
+
+    float getValue() const override { return value.load(); }
+
+    void setValue (float newValue) override
+    {
+        value.store (juce::jlimit (0.0f, 1.0f, newValue));
+    }
+
+    float getDefaultValue() const override { return defaultValue.load(); }
+
+    juce::String getName (int maximumStringLength) const override
+    {
+        const juce::ScopedLock lock (metadataLock);
+        auto text = active.load() ? name : "Hosted Param " + juce::String (index + 1);
+        return maximumStringLength > 0 ? text.substring (0, maximumStringLength) : text;
+    }
+
+    juce::String getLabel() const override
+    {
+        const juce::ScopedLock lock (metadataLock);
+        return label;
+    }
+
+    int getNumSteps() const override { return steps.load(); }
+    bool isDiscrete() const override { return discrete.load(); }
+    bool isBoolean() const override { return boolean.load(); }
+    bool isAutomatable() const override { return true; }
+
+    juce::String getText (float normalisedValue, int maximumStringLength) const override
+    {
+        auto text = juce::String (normalisedValue, 3);
+        return maximumStringLength > 0 ? text.substring (0, maximumStringLength) : text;
+    }
+
+    float getValueForText (const juce::String& text) const override
+    {
+        return juce::jlimit (0.0f, 1.0f, text.getFloatValue());
+    }
+
+    void reset()
+    {
+        const juce::ScopedLock lock (metadataLock);
+        active.store (false);
+        name = "Hosted Param " + juce::String (index + 1);
+        label.clear();
+        defaultValue.store (0.0f);
+        value.store (0.0f);
+        steps.store (juce::AudioProcessor::getDefaultNumParameterSteps());
+        discrete.store (false);
+        boolean.store (false);
+    }
+
+    void updateMetadata (const juce::String& newName,
+                         const juce::String& newLabel,
+                         float newDefaultValue,
+                         float newValue,
+                         int newSteps,
+                         bool newDiscrete,
+                         bool newBoolean)
+    {
+        {
+            const juce::ScopedLock lock (metadataLock);
+            active.store (true);
+            name = newName.isNotEmpty() ? newName : "Parameter " + juce::String (index + 1);
+            label = newLabel;
+            defaultValue.store (juce::jlimit (0.0f, 1.0f, newDefaultValue));
+            steps.store (juce::jmax (2, newSteps));
+            discrete.store (newDiscrete);
+            boolean.store (newBoolean);
+        }
+
+        setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, newValue));
+    }
+
+    bool isActive() const { return active.load(); }
+
+private:
+    int index = 0;
+    mutable juce::CriticalSection metadataLock;
+    std::atomic<float> value { 0.0f };
+    std::atomic<float> defaultValue { 0.0f };
+    std::atomic<int> steps { juce::AudioProcessor::getDefaultNumParameterSteps() };
+    std::atomic<bool> discrete { false };
+    std::atomic<bool> boolean { false };
+    std::atomic<bool> active { false };
+    juce::String name;
+    juce::String label;
+};
+
 IntelVSTWrapperAudioProcessor::BusesProperties IntelVSTWrapperAudioProcessor::makeBuses()
 {
     return BusesProperties()
@@ -134,6 +236,14 @@ IntelVSTWrapperAudioProcessor::BusesProperties IntelVSTWrapperAudioProcessor::ma
 IntelVSTWrapperAudioProcessor::IntelVSTWrapperAudioProcessor()
     : AudioProcessor (makeBuses())
 {
+    lastSentParameterValues.fill (-1.0f);
+
+    for (auto i = 0; i < maxMirroredParameters; ++i)
+    {
+        auto* parameter = new MirroredParameter (i);
+        mirroredParameters[static_cast<size_t> (i)] = parameter;
+        addParameter (parameter);
+    }
 }
 
 IntelVSTWrapperAudioProcessor::~IntelVSTWrapperAudioProcessor()
@@ -184,14 +294,56 @@ juce::AudioProcessorEditor* IntelVSTWrapperAudioProcessor::createEditor()
 
 void IntelVSTWrapperAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
+    juce::MemoryBlock stateToStore;
+    juce::String pathToStore;
+
+    {
+        const juce::ScopedLock lock (bridgeLock);
+
+        if (pluginLoaded && socket != nullptr && socket->isConnected())
+            fetchHostedState (hostedPluginState);
+
+        stateToStore = hostedPluginState;
+        pathToStore = hostedPluginPath;
+    }
+
     juce::MemoryOutputStream out (destData, true);
-    intelvst::bridge::writeString (out, hostedPluginPath);
+    out.writeInt (wrapperStateMagic);
+    out.writeInt (wrapperStateVersion);
+    intelvst::bridge::writeString (out, pathToStore);
+    out.writeInt (static_cast<int> (stateToStore.getSize()));
+
+    if (! stateToStore.isEmpty())
+        out.write (stateToStore.getData(), stateToStore.getSize());
 }
 
 void IntelVSTWrapperAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     juce::MemoryInputStream in (data, static_cast<size_t> (sizeInBytes), false);
-    const auto restoredPath = intelvst::bridge::readString (in);
+    juce::String restoredPath;
+    juce::MemoryBlock restoredHostedState;
+
+    const auto maybeMagic = in.readInt();
+
+    if (maybeMagic == wrapperStateMagic)
+    {
+        const auto version = in.readInt();
+        restoredPath = intelvst::bridge::readString (in);
+
+        if (version >= 1)
+        {
+            const auto stateBytes = juce::jmax (0, in.readInt());
+            restoredHostedState.setSize (static_cast<size_t> (stateBytes), false);
+
+            if (stateBytes > 0)
+                in.read (restoredHostedState.getData(), stateBytes);
+        }
+    }
+    else
+    {
+        in.setPosition (0);
+        restoredPath = intelvst::bridge::readString (in);
+    }
 
     const juce::ScopedLock lock (bridgeLock);
 
@@ -203,6 +355,9 @@ void IntelVSTWrapperAudioProcessor::setStateInformation (const void* data, int s
     }
 
     hostedPluginPath = restoredPath;
+    hostedPluginState = restoredHostedState;
+    pendingHostedPluginState = restoredHostedState;
+    pendingHostedPluginStateValid = ! restoredHostedState.isEmpty();
     pendingStateLoad = hostedPluginPath.isNotEmpty();
     setBridgeStatus (pendingStateLoad ? "Restored " + juce::File (hostedPluginPath).getFileName()
                                       : "No hosted plugin selected");
@@ -235,6 +390,10 @@ void IntelVSTWrapperAudioProcessor::setHostedPluginPath (const juce::String& pat
         return;
 
     hostedPluginPath = path;
+    hostedPluginState.reset();
+    pendingHostedPluginState.reset();
+    pendingHostedPluginStateValid = false;
+    clearMirroredParameters();
     setBridgeStatus ("Selected " + juce::File (path).getFileName());
     wrapperLog ("Selected hosted plugin: " + path);
     stopHelper();
@@ -382,6 +541,20 @@ bool IntelVSTWrapperAudioProcessor::loadHostedPlugin()
     hostedPluginPath = path;
     pluginLoaded = true;
     helperPrepared = false;
+
+    refreshHostedParameters();
+
+    if (pendingHostedPluginStateValid)
+    {
+        if (sendHostedState (pendingHostedPluginState))
+        {
+            hostedPluginState = pendingHostedPluginState;
+            pendingHostedPluginState.reset();
+            pendingHostedPluginStateValid = false;
+            refreshHostedParameters();
+        }
+    }
+
     return true;
 }
 
@@ -431,6 +604,32 @@ bool IntelVSTWrapperAudioProcessor::processRemotely (juce::AudioBuffer<float>& b
     const auto samples = buffer.getNumSamples();
     out.writeInt (channels);
     out.writeInt (samples);
+
+    auto parameterUpdateCountPosition = out.getPosition();
+    out.writeInt (0);
+
+    auto parameterUpdateCount = 0;
+    for (auto i = 0; i < maxMirroredParameters; ++i)
+    {
+        auto* parameter = mirroredParameters[static_cast<size_t> (i)];
+        if (parameter == nullptr || ! parameter->isActive())
+            continue;
+
+        const auto value = parameter->getValue();
+        if (std::abs (value - lastSentParameterValues[static_cast<size_t> (i)]) <= 0.000001f)
+            continue;
+
+        out.writeInt (i);
+        out.writeFloat (value);
+        lastSentParameterValues[static_cast<size_t> (i)] = value;
+        ++parameterUpdateCount;
+    }
+
+    const auto afterParameterUpdates = out.getPosition();
+    out.setPosition (parameterUpdateCountPosition);
+    out.writeInt (parameterUpdateCount);
+    out.setPosition (afterParameterUpdates);
+
     out.writeInt (midi.getNumEvents());
 
     for (const auto metadata : midi)
@@ -508,6 +707,98 @@ bool IntelVSTWrapperAudioProcessor::receiveAckOrStatus (const char* action)
 
     setBridgeStatus (juce::String ("Unexpected bridge reply during ") + action);
     return false;
+}
+
+bool IntelVSTWrapperAudioProcessor::refreshHostedParameters()
+{
+    if (socket == nullptr || ! socket->isConnected())
+        return false;
+
+    if (! intelvst::bridge::sendMessage (*socket, intelvst::bridge::MessageType::getParameters))
+    {
+        setBridgeStatus ("Could not ask bridge for parameters");
+        return false;
+    }
+
+    intelvst::bridge::MessageType replyType;
+    juce::MemoryBlock reply;
+    if (! intelvst::bridge::receiveMessage (*socket, replyType, reply)
+        || replyType != intelvst::bridge::MessageType::parameters)
+    {
+        setBridgeStatus ("Could not read hosted plugin parameters");
+        return false;
+    }
+
+    clearMirroredParameters();
+
+    juce::MemoryInputStream in (reply, false);
+    const auto parameterCount = juce::jlimit (0, maxMirroredParameters, in.readInt());
+
+    for (auto i = 0; i < parameterCount; ++i)
+    {
+        const auto name = intelvst::bridge::readString (in);
+        const auto label = intelvst::bridge::readString (in);
+        const auto defaultValue = in.readFloat();
+        const auto value = in.readFloat();
+        const auto steps = in.readInt();
+        const auto discrete = in.readBool();
+        const auto boolean = in.readBool();
+
+        if (auto* parameter = mirroredParameters[static_cast<size_t> (i)])
+            parameter->updateMetadata (name, label, defaultValue, value, steps, discrete, boolean);
+
+        lastSentParameterValues[static_cast<size_t> (i)] = -1.0f;
+    }
+
+    wrapperLog ("Mirrored " + juce::String (parameterCount) + " hosted parameters");
+    return true;
+}
+
+bool IntelVSTWrapperAudioProcessor::fetchHostedState (juce::MemoryBlock& state)
+{
+    if (socket == nullptr || ! socket->isConnected())
+        return false;
+
+    if (! intelvst::bridge::sendMessage (*socket, intelvst::bridge::MessageType::getState))
+        return false;
+
+    intelvst::bridge::MessageType replyType;
+    juce::MemoryBlock reply;
+    if (! intelvst::bridge::receiveMessage (*socket, replyType, reply)
+        || replyType != intelvst::bridge::MessageType::state)
+        return false;
+
+    state = reply;
+    return true;
+}
+
+bool IntelVSTWrapperAudioProcessor::sendHostedState (const juce::MemoryBlock& state)
+{
+    if (socket == nullptr || ! socket->isConnected())
+        return false;
+
+    if (! intelvst::bridge::sendMessage (*socket, intelvst::bridge::MessageType::setState, state))
+    {
+        setBridgeStatus ("Could not send hosted plugin state");
+        return false;
+    }
+
+    if (! receiveAckOrStatus ("restore hosted plugin state"))
+        return false;
+
+    wrapperLog ("Restored hosted plugin state: " + juce::String (static_cast<int> (state.getSize())) + " bytes");
+    return true;
+}
+
+void IntelVSTWrapperAudioProcessor::clearMirroredParameters()
+{
+    for (auto i = 0; i < maxMirroredParameters; ++i)
+    {
+        if (auto* parameter = mirroredParameters[static_cast<size_t> (i)])
+            parameter->reset();
+
+        lastSentParameterValues[static_cast<size_t> (i)] = -1.0f;
+    }
 }
 
 juce::File IntelVSTWrapperAudioProcessor::findBundledHelper() const

@@ -170,6 +170,7 @@ if(INTEL_VST_WRAPPER_USE_LEGACY_HELPER)
         CMAKE_ARGS ${INTEL_VST_WRAPPER_LEGACY_HELPER_ARGS}
         BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target IntelVSTBridgeHelper --config $<CONFIG>
         INSTALL_COMMAND ""
+        BUILD_ALWAYS TRUE
         BUILD_BYPRODUCTS "${INTEL_VST_WRAPPER_HELPER_EXECUTABLE}")
 
     add_custom_target(IntelVSTBridgeHelper DEPENDS IntelVSTBridgeHelperExternal)
