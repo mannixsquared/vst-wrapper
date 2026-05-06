@@ -112,4 +112,5 @@ add_custom_command(TARGET IntelVSTBridgeHelper POST_BUILD
     COMMAND /usr/libexec/PlistBuddy
             -c "Set :NSHighResolutionCapable false"
             "$<TARGET_BUNDLE_DIR:IntelVSTBridgeHelper>/Contents/Info.plist"
+    COMMAND /bin/sh -c "/usr/libexec/PlistBuddy -c 'Print :LSUIElement' '$<TARGET_BUNDLE_DIR:IntelVSTBridgeHelper>/Contents/Info.plist' >/dev/null 2>&1 && /usr/libexec/PlistBuddy -c 'Set :LSUIElement true' '$<TARGET_BUNDLE_DIR:IntelVSTBridgeHelper>/Contents/Info.plist' || /usr/libexec/PlistBuddy -c 'Add :LSUIElement bool true' '$<TARGET_BUNDLE_DIR:IntelVSTBridgeHelper>/Contents/Info.plist'"
     VERBATIM)

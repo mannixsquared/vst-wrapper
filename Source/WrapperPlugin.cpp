@@ -470,28 +470,8 @@ bool IntelVSTWrapperAudioProcessor::ensureHelper()
     const auto port = listener->getBoundPort();
     juce::StringArray args;
 
-   #if JUCE_MAC
-    const auto maybeAppBundle = helper.getParentDirectory()
-                                      .getParentDirectory()
-                                      .getParentDirectory();
-    const auto launchViaBundle = maybeAppBundle.hasFileExtension ("app")
-                              && maybeAppBundle.isDirectory()
-                              && envVar ("INTEL_VST_WRAPPER_HELPER_PATH").isEmpty();
-
-    if (launchViaBundle)
-    {
-        args.add ("/usr/bin/open");
-        args.add ("-n");
-        args.add (maybeAppBundle.getFullPathName());
-        args.add ("--args");
-        args.add (juce::String (port));
-    }
-    else
-   #endif
-    {
-        args.add (helper.getFullPathName());
-        args.add (juce::String (port));
-    }
+    args.add (helper.getFullPathName());
+    args.add (juce::String (port));
 
     if (! helperProcess.start (args))
     {

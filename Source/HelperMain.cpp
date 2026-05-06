@@ -14,6 +14,13 @@
 
 namespace
 {
+#if JUCE_MAC && INTEL_VST_WRAPPER_ENABLE_HOSTED_UI
+    void configureHiddenHelperProcess()
+    {
+        [[NSProcessInfo processInfo] setProcessName: @"IntelVSTBridgeHelper"];
+    }
+#endif
+
     void helperLog (const juce::String& message)
     {
         const auto logFile = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
@@ -316,7 +323,6 @@ namespace
 
             if (editorWindow != nullptr)
            {
-                juce::Process::makeForegroundProcess();
                 editorWindow->setVisible (true);
                 editorWindow->setAlwaysOnTop (true);
                 editorWindow->toFront (true);
@@ -347,8 +353,6 @@ namespace
             editor->setOpaque (false);
             applyPluginResourceWorkingDirectory();
             prepareVSTGUIRendererDiagnostics();
-            juce::Process::setDockIconVisible (true);
-            juce::Process::makeForegroundProcess();
 
             editorWindow = std::make_unique<PluginEditorWindow> (instance->getName());
             editorWindow->setContentOwned (editor, true);
@@ -922,8 +926,7 @@ public:
 
     void initialise (const juce::String& commandLine) override
     {
-        juce::Process::setDockIconVisible (true);
-        juce::Process::makeForegroundProcess();
+        configureHiddenHelperProcess();
 
         const auto port = commandLine.trim().getIntValue();
         if (port <= 0)
